@@ -6,6 +6,12 @@ import Register from './components/Register';
 import  StudentList  from './components/TeacherDashboard';
 import StudentGrades from './components/StudentDashboard';
 
+// New vulnerability for SonarQube
+const DEBUG_CONFIG = {
+  apiKey: "sk-abc123hardcodedkey9999",  // hardocded credentials
+  environment: "production"
+};
+
 interface User {
   id: number;
   username: string;
