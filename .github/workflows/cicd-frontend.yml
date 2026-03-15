@@ -1,0 +1,158 @@
+name: Frontend CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened ]
+
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/lms-frontend
+  REACT_APP_API_URL: http://${{ secrets.SERVER_IP }}
+
+jobs:
+  ci-cd:
+    name: Build, Scan & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Required for SonarQube blame data
+
+      # ── Node & Tests ─────────────────────────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test -- --coverage --watchAll=false --ci --passWithNoTests
+
+      # ── SonarQube ────────────────────────────────────────────────────────────
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            "-Dsonar.projectName=LMS Frontend"
+            -Dsonar.sources=src
+            -Dsonar.tests=src/__tests__
+            -Dsonar.exclusions=**/node_modules/**,**/*.test.js,**/*.test.tsx,**/coverage/**
+            -Dsonar.test.inclusions=**/*.test.js,**/*.test.tsx
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.sourceEncoding=UTF-8
+
+      # ── SNYK ─────────────────────────────────────────────────────────────────
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        continue-on-error: true  # Prevents pipeline failing on found vulns; remove to enforce
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+      # ── Docker Build ─────────────────────────────────────────────────────────
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build Docker image (local tag for Trivy)
+        run: |
+          docker build \
+            --build-arg REACT_APP_API_URL=${{ env.REACT_APP_API_URL }} \
+            -t ${{ env.DOCKER_IMAGE }}:local .
+
+      # ── Trivy ────────────────────────────────────────────────────────────────
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          image-ref: '${{ env.DOCKER_IMAGE }}:local'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # ── Push Image ───────────────────────────────────────────────────────────
+      - name: Build and push multi-platform image
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          no-cache: true
+          build-args: |
+            REACT_APP_API_URL=${{ env.REACT_APP_API_URL }}
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:latest
+            ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:latest
+          cache-to: type=inline
+
+      # ── Deploy ───────────────────────────────────────────────────────────────
+      - name: Set up SSH
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to server
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} '
+            echo "Pulling latest frontend image..."
+            docker-compose pull frontend
+            echo "Restarting frontend container..."
+            docker-compose up -d --no-deps --force-recreate frontend
+            echo "Cleaning up unused images..."
+            docker image prune -f
+            echo "Frontend deployment complete!"
+          '
+
+      # ── ZAP ──────────────────────────────────────────────────────────────────
+      - name: Run ZAP scan on server
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} '
+            docker pull ghcr.io/zaproxy/zaproxy:stable
+            docker run --rm -v /tmp:/zap/wrk -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+              -t http://${{ secrets.SERVER_IP }}:80 \
+              -r zap_report.html \
+              -I -d
+          '
+
+      - name: Download ZAP report from server
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          scp ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/tmp/zap_report.html ./zap_report.html
+
+      - name: Upload ZAP report as artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-frontend-report
+          path: zap_report.html
