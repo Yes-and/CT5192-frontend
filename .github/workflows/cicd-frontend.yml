@@ -61,7 +61,7 @@ jobs:
         with:
           args: --severity-threshold=high
 
-      # ── Docker Build ─────────────────────────────────────────────────────────
+      # ── Docker Setup ─────────────────────────────────────────────────────────
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -74,25 +74,7 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build Docker image (local tag for Trivy)
-        run: |
-          docker build \
-            --build-arg REACT_APP_API_URL=${{ env.REACT_APP_API_URL }} \
-            -t ${{ env.DOCKER_IMAGE }}:local .
-
-      # ── Trivy ────────────────────────────────────────────────────────────────
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        continue-on-error: true
-        with:
-          image-ref: '${{ env.DOCKER_IMAGE }}:local'
-          format: 'table'
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
-
-      # ── Push Image ───────────────────────────────────────────────────────────
+      # ── Docker Build & Push ───────────────────────────────────────────────────
       - name: Build and push multi-platform image
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: docker/build-push-action@v5
@@ -100,7 +82,6 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          no-cache: true
           build-args: |
             REACT_APP_API_URL=${{ env.REACT_APP_API_URL }}
           tags: |
@@ -108,6 +89,19 @@ jobs:
             ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
           cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:latest
           cache-to: type=inline
+
+      # ── Trivy ────────────────────────────────────────────────────────────────
+      - name: Run Trivy vulnerability scanner
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          image-ref: '${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
 
       # ── Deploy ───────────────────────────────────────────────────────────────
       - name: Set up SSH
@@ -131,18 +125,3 @@ jobs:
             echo "Frontend deployment complete!"
           '
 
-      # ── ZAP ──────────────────────────────────────────────────────────────────
-      - name: Run ZAP baseline scan
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          mkdir -p ${{ github.workspace }}/zap-work
-          chmod 777 ${{ github.workspace }}/zap-work
-          docker pull ghcr.io/zaproxy/zaproxy:stable -q
-          docker run --rm             --network=host             -v ${{ github.workspace }}/zap-work:/zap/wrk:rw             ghcr.io/zaproxy/zaproxy:stable             zap-baseline.py             -t http://${{ secrets.SERVER_IP }}:80             -r /zap/wrk/zap_report.html             -I -d || true
-
-      - name: Upload ZAP report
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/upload-artifact@v4
-        with:
-          name: zap-frontend-report
-          path: ${{ github.workspace }}/zap-work/zap_report.html
