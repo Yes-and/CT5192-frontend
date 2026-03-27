@@ -117,9 +117,9 @@ jobs:
         run: |
           ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} '
             echo "Pulling latest frontend image..."
-            docker-compose pull frontend
+            docker compose pull frontend
             echo "Restarting frontend container..."
-            docker-compose up -d --no-deps --force-recreate frontend
+            docker compose up -d --no-deps --force-recreate frontend
             echo "Cleaning up unused images..."
             docker image prune -f
             echo "Frontend deployment complete!"
